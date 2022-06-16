@@ -162,7 +162,7 @@ func (h *dialer) startDisconnect(ctx context.Context) {
 
 func (h *dialer) connToStreamLoop(ctx context.Context, wg *sync.WaitGroup) {
 	endReason := ""
-	endLevel := dlog.LogLevelError
+	endLevel := dlog.LogLevelDebug
 	id := h.stream.ID()
 
 	outgoing := make(chan Message, 5)
@@ -189,12 +189,11 @@ func (h *dialer) connToStreamLoop(ctx context.Context, wg *sync.WaitGroup) {
 			switch {
 			case errors.Is(err, io.EOF):
 				endReason = "EOF was encountered"
-				endLevel = dlog.LogLevelDebug
 			case errors.Is(err, net.ErrClosed):
 				endReason = "the connection was closed"
-				endLevel = dlog.LogLevelDebug
 			default:
 				endReason = fmt.Sprintf("a read error occurred: %v", err)
+				endLevel = dlog.LogLevelError
 			}
 			h.startDisconnect(ctx)
 			return
@@ -218,15 +217,22 @@ func (h *dialer) connToStreamLoop(ctx context.Context, wg *sync.WaitGroup) {
 
 func (h *dialer) streamToConnLoop(ctx context.Context, wg *sync.WaitGroup) {
 	endReason := ""
-	endLevel := dlog.LogLevelError
 	id := h.stream.ID()
 	defer func() {
 		wg.Done()
 		h.startDisconnect(ctx)
-		dlog.Logf(ctx, endLevel, "   CONN %s stream-to-conn loop ended because %s", id, endReason)
+		dlog.Debugf(ctx, "   CONN %s stream-to-conn loop ended because %s", id, endReason)
 	}()
 
 	incoming, errCh := ReadLoop(ctx, h.stream)
+
+	connWrite := h.conn.Write
+	if udpConn, ok := h.conn.(*net.UDPConn); ok && udpConn.RemoteAddr() == nil {
+		addr := h.stream.ID().SourceAddr()
+		connWrite = func(payload []byte) (int, error) {
+			return udpConn.WriteTo(payload, addr)
+		}
+	}
 
 	dlog.Debugf(ctx, "   CONN %s stream-to-conn loop started", id)
 	for atomic.LoadInt32(&h.connected) != notConnected {
@@ -243,7 +249,6 @@ func (h *dialer) streamToConnLoop(ctx context.Context, wg *sync.WaitGroup) {
 			if dg == nil {
 				// h.incoming was closed by the reader and is now drained.
 				endReason = "there was no more input"
-				endLevel = dlog.LogLevelDebug
 				return
 			}
 			if !h.resetIdle() {
@@ -257,7 +262,7 @@ func (h *dialer) streamToConnLoop(ctx context.Context, wg *sync.WaitGroup) {
 			payload := dg.Payload()
 			pn := len(payload)
 			for n := 0; n < pn; {
-				wn, err := h.conn.Write(payload[n:])
+				wn, err := connWrite(payload[n:])
 				if err != nil {
 					h.startDisconnect(ctx)
 					endReason = fmt.Sprintf("a write error occurred: %v", err)
